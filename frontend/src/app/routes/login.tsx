@@ -1,5 +1,4 @@
-import { useGoogleLogin } from '@react-oauth/google'
-import React, { useCallback, useEffect, useMemo, useRef } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, lazy, Suspense } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { useForm } from 'react-hook-form'
 import { z } from 'zod'
@@ -18,6 +17,12 @@ import { setUser } from '@/state/slice/user'
 import { setAvailableModels, setSelectedModel } from '@/state'
 import { fetchWishlist } from '@/state/slice/favorites'
 import { toast } from 'sonner'
+
+// Lazy load the Google sign-in button to prevent @react-oauth/google import
+// when Google auth is disabled (VITE_GOOGLE_CLIENT_ID not set or VITE_DEV_AUTH_AUTOLOGIN=true)
+const GoogleSignInButton = lazy(
+    () => import('@/components/google-sign-in-button').then(m => ({ default: m.GoogleSignInButton }))
+)
 
 const FormSchema = z.object({
     email: z.email({ error: 'Invalid email address' }),
@@ -46,31 +51,13 @@ export function LoginPage() {
         }
     })
 
-    const googleLogin = useGoogleLogin({
-        flow: 'auth-code',
-        onSuccess: async (codeResponse) => {
-            try {
-                await loginWithAuthCode(codeResponse.code)
-                navigate('/')
-            } catch (error: unknown) {
-                const apiError = error as {
-                    response: { data: { detail: string } }
-                }
-                const errorMessage =
-                    typeof apiError?.response?.data?.detail === 'string'
-                        ? apiError.response.data.detail
-                        : 'Login failed. Please try again.'
-                if (errorMessage?.includes('beta')) {
-                    toast.info(errorMessage)
-                } else {
-                    toast.error(errorMessage)
-                }
-            }
-        },
-        onError: (errorResponse) => {
-            console.log('Login Failed:', errorResponse)
-        }
-    })
+    // Check if Google auth is enabled (same logic as provider.tsx)
+    const googleEnabled =
+        !!import.meta.env.VITE_GOOGLE_CLIENT_ID &&
+        import.meta.env.VITE_DEV_AUTH_AUTOLOGIN !== 'true'
+
+    // Check if dev auto-login is enabled
+    const devAutoLoginEnabled = import.meta.env.VITE_DEV_AUTH_AUTOLOGIN === 'true'
 
     const apiBaseUrl = useMemo(
         () => import.meta.env.VITE_API_URL || 'http://localhost:8000',
@@ -178,6 +165,36 @@ export function LoginPage() {
             authHandledRef.current = false
         }
     }, [handleAuthSuccess])
+
+    // Dev auto-login: automatically log in when VITE_DEV_AUTH_AUTOLOGIN is enabled
+    useEffect(() => {
+        if (!devAutoLoginEnabled) {
+            return
+        }
+
+        // Prevent infinite loop - only attempt once
+        if (authHandledRef.current) {
+            return
+        }
+
+        const attemptDevLogin = async () => {
+            try {
+                console.info('[auth] Attempting dev auto-login...')
+                const res = await fetch(`${apiBaseUrl}/auth/dev/login`)
+                if (!res.ok) {
+                    console.warn('[auth] Dev login endpoint not available, showing login page')
+                    return
+                }
+                const data = await res.json()
+                await handleAuthSuccess(data)
+                console.info('[auth] Dev auto-login successful')
+            } catch (error) {
+                console.error('[auth] Dev auto-login failed:', error)
+            }
+        }
+
+        void attemptDevLogin()
+    }, [devAutoLoginEnabled, apiBaseUrl, handleAuthSuccess])
 
     const loginWithII = useCallback(() => {
         authHandledRef.current = false
@@ -316,14 +333,32 @@ export function LoginPage() {
                         <p className="flex-1 dark:bg-white/[0.31] h-[1px]"></p>
                     </div>
                 </div>
-                <Button
-                    size="xl"
-                    onClick={() => googleLogin()}
-                    className="w-full bg-white text-black font-semibold shadow-btn"
-                >
-                    <Icon name="google" className="size-[22px]" />
-                    Continue with Google Account
-                </Button>
+                {googleEnabled && (
+                    <Suspense fallback={null}>
+                        <GoogleSignInButton
+                            onLoginSuccess={async (code) => {
+                                try {
+                                    await loginWithAuthCode(code)
+                                    navigate('/')
+                                } catch (error: unknown) {
+                                    const apiError = error as {
+                                        response: { data: { detail: string } }
+                                    }
+                                    const errorMessage =
+                                        typeof apiError?.response?.data?.detail === 'string'
+                                            ? apiError.response.data.detail
+                                            : 'Login failed. Please try again.'
+                                    if (errorMessage?.includes('beta')) {
+                                        toast.info(errorMessage)
+                                    } else {
+                                        toast.error(errorMessage)
+                                    }
+                                }
+                            }}
+                            onLoginError={() => console.log('Login Failed')}
+                        />
+                    </Suspense>
+                )}
                 <Button
                     size="xl"
                     onClick={loginWithII}
