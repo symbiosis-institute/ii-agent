@@ -408,29 +408,40 @@ class ChatService:
 
         logger.info(f"Started chat run {run_id} for session {session_id}")
 
-        logger.info(f"Retrieving vector store for user {user_id}, session {session_id}")
-        vector_store = await openai_vector_store.retrieve(
-            user_id=user_id, session_id=session_id
-        )
-        logger.info(f"Vector store retrieved: {vector_store}")
+        # Retrieve vector store (may fail if OpenAI not configured - that's okay for simple chat)
+        vector_store = None
+        try:
+            logger.info(f"Retrieving vector store for user {user_id}, session {session_id}")
+            vector_store = await openai_vector_store.retrieve(
+                user_id=user_id, session_id=session_id
+            )
+            logger.info(f"Vector store retrieved: {vector_store}")
+        except Exception as e:
+            logger.warning(f"Vector store retrieval failed (file search will be unavailable): {e}")
+            # Continue without vector store - file_search tool won't work but chat can still function
+
         logger.info(f"user_message.file_ids: {user_message.file_ids}")
 
         # Track newly uploaded files in this message
         newly_uploaded_files: list = []
         if user_message.file_ids:
-            logger.info(f"Adding {len(user_message.file_ids)} files to vector store...")
-            vs_files = await openai_vector_store.add_files_batch(
-                user_id=user_id,
-                session_id=session_id,
-                file_ids=user_message.file_ids,
-            )
-            logger.info(f"Added files: {len(vs_files)} to vector stores")
-            newly_uploaded_files = vs_files
+            try:
+                logger.info(f"Adding {len(user_message.file_ids)} files to vector store...")
+                vs_files = await openai_vector_store.add_files_batch(
+                    user_id=user_id,
+                    session_id=session_id,
+                    file_ids=user_message.file_ids,
+                )
+                logger.info(f"Added files: {len(vs_files)} to vector stores")
+                newly_uploaded_files = vs_files
 
-            # Re-fetch vector store to get updated file list
-            vector_store = await openai_vector_store.retrieve(
-                user_id=user_id, session_id=session_id
-            )
+                # Re-fetch vector store to get updated file list
+                vector_store = await openai_vector_store.retrieve(
+                    user_id=user_id, session_id=session_id
+                )
+            except Exception as e:
+                logger.warning(f"File upload to vector store failed (file search will be unavailable for these files): {e}")
+                # Continue without file indexing - chat can still function
 
         # Build file corpus info for AI discovery
         # This tells the AI what files are available for file_search
@@ -500,18 +511,19 @@ class ChatService:
 
             # Get user's active API key using existing helper
             user_api_key = await APIKeys.get_active_api_key_for_user(user_id)
-            if not user_api_key:
-                logger.error(f"No active API key found for user {user_id}")
-                raise ValueError(
-                    "User API key not found. Please configure API key in settings."
-                )
 
             # Instantiate tool instances (fresh per request)
-            all_search_tools: List[BaseTool] = [
-                WebSearchTool(config.tool_server_url, user_api_key, session_id),
-                ImageSearchTool(config.tool_server_url, user_api_key, session_id),
-                WebVisitTool(config.tool_server_url, user_api_key, session_id),
-            ]
+            # Only add search tools if we have a user API key
+            all_search_tools: List[BaseTool] = []
+            if user_api_key:
+                all_search_tools.extend([
+                    WebSearchTool(config.tool_server_url, user_api_key, session_id),
+                    ImageSearchTool(config.tool_server_url, user_api_key, session_id),
+                    WebVisitTool(config.tool_server_url, user_api_key, session_id),
+                ])
+            else:
+                logger.warning(f"No active API key found for user {user_id} - search tools disabled")
+
             if vector_store:
                 (
                     all_search_tools.append(

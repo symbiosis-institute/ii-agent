@@ -315,3 +315,181 @@ test('dev auto-login: user is automatically logged in without prompt', async ({ 
     console.log('✓ App loaded successfully, user is not on login page');
   }
 });
+
+/**
+ * Test chat mode: send a message and receive an LLM response.
+ * This is the critical test for verifying that Chat Mode actually returns an LLM response.
+ * The test will fail if:
+ * - The frontend sends but never receives a reply
+ * - The backend errors silently
+ * - Streaming/SSE/WebSocket wiring is broken
+ * - Provider calls fail without user-visible errors
+ */
+test('chat mode: send message and receive LLM response', async ({ page }) => {
+  const consoleErrors: string[] = [];
+  const pageErrors: Error[] = [];
+  const consoleMessages: string[] = [];
+
+  // Collect all errors and messages
+  page.on('pageerror', (err) => {
+    pageErrors.push(err);
+  });
+
+  page.on('console', (msg) => {
+    const text = msg.text();
+    consoleMessages.push(`[${msg.type()}] ${text}`);
+    if (msg.type() === 'error') {
+      consoleErrors.push(text);
+    }
+  });
+
+  // Navigate to homepage (dev auto-login should work)
+  await page.goto('/', { waitUntil: 'domcontentloaded' });
+
+  // Wait for page to stabilize - give extra time for auto-login to complete
+  await page.waitForLoadState('networkidle').catch(() => {});
+  await page.waitForTimeout(3000);
+
+  // Check for any critical errors before starting
+  if (pageErrors.length > 0) {
+    throw new Error(
+      `Page errors detected before chat:\n${pageErrors.map((e) => e.message).join('\n')}`
+    );
+  }
+
+  // Verify we're authenticated - wait explicitly for the "Hello" greeting
+  // This is the key indicator that auto-login worked
+  const authenticatedHello = page.locator('p:has-text("Hello")');
+  try {
+    await authenticatedHello.waitFor({ state: 'visible', timeout: 10000 });
+    console.log('✓ User is authenticated');
+  } catch (err) {
+    // Take screenshot for debugging
+    await page.screenshot({ path: 'test-results/chat-auth-fail.png', fullPage: true });
+    // Log console messages for debugging
+    console.log('=== Console messages ===');
+    consoleMessages.forEach(msg => console.log(msg));
+    console.log('=== End console messages ===');
+    throw new Error(`User is not authenticated. Chat test requires authenticated user. Console logs:\n${consoleMessages.join('\n')}`);
+  }
+
+  // Find the question input (textarea with placeholder or any textarea)
+  const questionInput = page.locator('textarea').first();
+  try {
+    await questionInput.waitFor({ state: 'visible', timeout: 5000 });
+  } catch (err) {
+    throw new Error('Question input not found on page');
+  }
+
+  // Type a simple test message
+  const testMessage = 'ping';
+  await questionInput.fill(testMessage);
+  console.log(`✓ Typed message: "${testMessage}"`);
+
+  // Press Enter to submit (the submit button has no text label, just an icon)
+  await questionInput.press('Enter');
+  console.log('✓ Pressed Enter to submit');
+
+  // Wait for navigation to chat page (the app navigates to /chat?id={sessionId} after submit)
+  await page.waitForTimeout(2000);
+  const currentUrl = page.url();
+  console.log(`Current URL after submit: ${currentUrl}`);
+
+  // If we navigated to a chat page, wait for it to load
+  if (currentUrl.includes('/chat?id=')) {
+    console.log('✓ Navigated to chat page');
+    await page.waitForLoadState('networkidle').catch(() => {});
+    await page.waitForTimeout(2000);
+  }
+
+  // Wait for response - we should see either:
+  // 1. An assistant message with non-empty content
+  // 2. A visible UI error with meaningful message
+  // 3. Or timeout after 60 seconds (indicating no response)
+
+  let gotAssistantResponse = false;
+  let gotVisibleError = false;
+  let errorMessage = '';
+
+  const timeoutMs = 60000;
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeoutMs) {
+    // Check for assistant message (look for common patterns)
+    const assistantMessage = page.locator('[data-testid="assistant-message"], .message.assistant, [role="assistant"]').first();
+    const isVisible = await assistantMessage.isVisible().catch(() => false);
+
+    if (isVisible) {
+      const textContent = await assistantMessage.textContent();
+      if (textContent && textContent.trim().length > 0) {
+        gotAssistantResponse = true;
+        console.log(`✓ Assistant response received: "${textContent.trim().substring(0, 100)}..."`);
+        break;
+      }
+    }
+
+    // Check for visible error banners/toasts
+    const errorBanner = page.locator('.error, .toast-error, [role="alert"], text=/error/i').first();
+    const hasError = await errorBanner.isVisible().catch(() => false);
+
+    if (hasError) {
+      gotVisibleError = true;
+      errorMessage = await errorBanner.textContent();
+      console.log(`⚠ Visible error detected: "${errorMessage}"`);
+      break;
+    }
+
+    // Check for new console errors
+    if (consoleErrors.length > 0) {
+      const newErrors = consoleErrors.filter((e) =>
+        e.includes('stream') ||
+        e.includes('SSE') ||
+        e.includes('network') ||
+        e.includes('fetch')
+      );
+      if (newErrors.length > 0) {
+        console.log(`⚠ Console errors during chat: ${newErrors.join('; ')}`);
+      }
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  // After waiting, we should have either a response or a visible error
+  if (gotVisibleError) {
+    throw new Error(`Chat failed with visible error: ${errorMessage}`);
+  }
+
+  if (!gotAssistantResponse) {
+    // Check for specific failure indicators
+    const stillSending = await page.locator('text=/sending|loading|thinking/i').first().isVisible().catch(() => false);
+
+    if (stillSending) {
+      throw new Error('Chat appears stuck in "sending/loading" state - no response received after timeout');
+    }
+
+    // Check for HTTP errors in console
+    const httpErrors = consoleErrors.filter((e) =>
+      e.includes('401') ||
+      e.includes('403') ||
+      e.includes('500') ||
+      e.includes('502') ||
+      e.includes('503')
+    );
+
+    if (httpErrors.length > 0) {
+      throw new Error(`HTTP errors detected in console: ${httpErrors.join('; ')}`);
+    }
+
+    throw new Error('No assistant response received after 60 seconds - chat may have failed silently');
+  }
+
+  // Verify no page errors occurred during chat
+  if (pageErrors.length > 0) {
+    throw new Error(
+      `Page errors detected during chat:\n${pageErrors.map((e) => e.message).join('\n')}`
+    );
+  }
+
+  console.log('✓ Chat mode test passed: Assistant responded successfully');
+});
