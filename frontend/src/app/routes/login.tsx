@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, lazy, Suspense } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, lazy, Suspense, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { useForm } from 'react-hook-form'
 import { z } from 'zod'
@@ -42,6 +42,10 @@ export function LoginPage() {
     const navigate = useNavigate()
     const { loginWithAuthCode } = useAuth()
     const dispatch = useAppDispatch()
+
+    // Loading state for dev auto-login
+    const [isAutoLoggingIn, setIsAutoLoggingIn] = useState(false)
+    const [autoLoginError, setAutoLoginError] = useState<string | null>(null)
 
     const form = useForm<z.infer<typeof FormSchema>>({
         resolver: zodResolver(FormSchema),
@@ -178,11 +182,16 @@ export function LoginPage() {
         }
 
         const attemptDevLogin = async () => {
+            setIsAutoLoggingIn(true)
+            setAutoLoginError(null)
             try {
                 console.info('[auth] Attempting dev auto-login...')
                 const res = await fetch(`${apiBaseUrl}/auth/dev/login`)
                 if (!res.ok) {
-                    console.warn('[auth] Dev login endpoint not available, showing login page')
+                    const errorText = await res.text().catch(() => 'Unknown error')
+                    console.warn('[auth] Dev login endpoint not available:', errorText)
+                    setAutoLoginError('Dev login endpoint not available. Please use another login method.')
+                    setIsAutoLoggingIn(false)
                     return
                 }
                 const data = await res.json()
@@ -190,6 +199,8 @@ export function LoginPage() {
                 console.info('[auth] Dev auto-login successful')
             } catch (error) {
                 console.error('[auth] Dev auto-login failed:', error)
+                setAutoLoginError('Auto-login failed. Please try another login method.')
+                setIsAutoLoggingIn(false)
             }
         }
 
@@ -231,6 +242,41 @@ export function LoginPage() {
     }
 
     const hideSigninWithPassword = true
+
+    // When dev auto-login is in progress, show loading state
+    if (isAutoLoggingIn) {
+        return (
+            <div className="flex flex-col items-center justify-center w-full h-full">
+                <h1 className="text-[25px] md:text-[32px] font-semibold dark:text-sky-blue mb-4">
+                    Signing you in...
+                </h1>
+                <div className="animate-spin h-8 w-8 border-4 border-sky-blue border-t-transparent rounded-full" />
+            </div>
+        )
+    }
+
+    // If auto-login failed and dev auto-login is enabled, show error with fallback option
+    if (autoLoginError && devAutoLoginEnabled) {
+        return (
+            <div className="flex flex-col items-center justify-center w-full h-full">
+                <h1 className="text-[25px] md:text-[32px] font-semibold dark:text-sky-blue mb-4">
+                    Auto-Login Failed
+                </h1>
+                <p className="text-red-500 mb-8">{autoLoginError}</p>
+                <Button
+                    size="xl"
+                    onClick={() => {
+                        setIsAutoLoggingIn(false)
+                        setAutoLoginError(null)
+                        authHandledRef.current = false
+                    }}
+                    className="bg-sky-blue dark:bg-sky-blue text-black font-semibold"
+                >
+                    Back to Login Options
+                </Button>
+            </div>
+        )
+    }
 
     return (
         <div className="flex flex-col items-center justify-center w-full h-full">
@@ -359,18 +405,20 @@ export function LoginPage() {
                         />
                     </Suspense>
                 )}
-                <Button
-                    size="xl"
-                    onClick={loginWithII}
-                    className="w-full mt-4 md:mt-10 bg-white text-black font-semibold shadow-btn"
-                >
-                    <img
-                        src="/images/logo-charcoal.png"
-                        alt="logo"
-                        className="size-[22px]"
-                    />
-                    Continue with II Account
-                </Button>
+                {!devAutoLoginEnabled && (
+                    <Button
+                        size="xl"
+                        onClick={loginWithII}
+                        className="w-full mt-4 md:mt-10 bg-white text-black font-semibold shadow-btn"
+                    >
+                        <img
+                            src="/images/logo-charcoal.png"
+                            alt="logo"
+                            className="size-[22px]"
+                        />
+                        Continue with II Account
+                    </Button>
+                )}
                 <DevLoginButton
                     apiBaseUrl={apiBaseUrl}
                     onSuccess={handleAuthSuccess}
