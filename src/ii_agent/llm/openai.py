@@ -94,6 +94,60 @@ class BaseOpenAIClient(LLMClient, ABC):
                 max_retries=llm_config.max_retries,
             )
 
+    def _requires_legacy_completion_params(self) -> bool:
+        """Detect if provider requires legacy (max_tokens) instead of max_completion_tokens.
+
+        GLM/BigModel and some other OpenAI-compatible providers don't support
+        max_completion_tokens (introduced for OpenAI o1+ models).
+
+        Detection prioritizes specific host patterns over generic ones:
+        1. Known GLM/BigModel hosts (bigmodel.cn, zhipu.ai)
+        2. GLM model names (glm-4, glm-3-turbo, etc.)
+
+        Note: GLM models use APITypes.CUSTOM and are routed to OpenAIDirectClient
+        (not OpenAIResponsesClient), so this fix covers both chat and agent modes.
+        """
+        base_url = self.config.base_url or ""
+        model_name = self.model_name or ""
+
+        # Specific GLM/BigModel host patterns (avoid false positives)
+        glm_hosts = ["bigmodel.cn", "zhipu.ai", "bigmodel", "zhipu"]
+        if any(host in base_url.lower() for host in glm_hosts):
+            return True
+
+        # GLM model names (must start with "glm-" to avoid false positives)
+        if model_name.lower().startswith("glm-"):
+            return True
+
+        return False
+
+    def _is_glm_provider(self) -> bool:
+        """Detect if the current provider is GLM/BigModel (zhipu AI).
+
+        This is an alias for _requires_legacy_completion_params since GLM is the
+        primary known provider that needs these adjustments.
+        """
+        return self._requires_legacy_completion_params()
+
+    def _normalize_tools_for_glm(self, tools: list) -> list:
+        """Normalize tool definitions for GLM compatibility.
+
+        GLM doesn't support OpenAI's 'strict' mode for tools.
+        This removes the strict parameter from tool schemas.
+        """
+        normalized_tools = []
+        for tool in tools:
+            normalized_tool = tool.copy()
+            function_def = normalized_tool.get("function", {})
+            if "parameters" in function_def and isinstance(function_def["parameters"], dict):
+                # Remove 'strict' parameter - GLM doesn't support it
+                function_def["parameters"] = {
+                    k: v for k, v in function_def["parameters"].items()
+                    if k != "strict"
+                }
+            normalized_tools.append(normalized_tool)
+        return normalized_tools
+
     async def _ahandle_retries(self, operation_func, *args, **kwargs):
         """Handle retry logic for API calls."""
         for retry in range(self.max_retries):
@@ -789,12 +843,17 @@ class OpenAIDirectClient(BaseOpenAIClient):
 
         openai_tools = []
         for tool in tools:
+            # Copy schema to avoid mutating original tool.input_schema
+            # This prevents strict: true from leaking into GLM requests
+            parameters = tool.input_schema.copy()
+            # Only add strict mode for OpenAI (not GLM/other compatible providers)
+            if not self._is_glm_provider():
+                parameters["strict"] = True
             tool_def = {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.input_schema,
+                "parameters": parameters,
             }
-            tool_def["parameters"]["strict"] = True
             openai_tools.append(
                 {
                     "type": "function",
@@ -804,14 +863,22 @@ class OpenAIDirectClient(BaseOpenAIClient):
         if len(openai_tools) == 0:
             tool_choice_param=None
 
+        # Determine max_tokens parameter name based on provider
+        # GLM and other OpenAI-compatible providers use 'max_tokens'
+        # OpenAI o1+ models use 'max_completion_tokens'
+        if self._is_glm_provider():
+            max_tokens_param = {"max_tokens": max_tokens}
+        else:
+            max_tokens_param = {"max_completion_tokens": max_tokens}
+
         async def _create_completion():
             response = await self.async_client.chat.completions.create(
                 model=self.model_name,
                 messages=openai_messages,
                 tools=openai_tools if openai_tools else OpenAI_NOT_GIVEN,
                 tool_choice=tool_choice_param,
-                max_completion_tokens=max_tokens,
                 stop=stop_sequence,
+                **max_tokens_param,
             )
             assert response is not None, "OpenAI response is None"
             return response
@@ -907,12 +974,17 @@ class OpenAIDirectClient(BaseOpenAIClient):
             openai_messages[-1]["prefix"] = prefix
 
         for tool in tools:
+            # Copy schema to avoid mutating original tool.input_schema
+            # This prevents strict: true from leaking into GLM requests
+            parameters = tool.input_schema.copy()
+            # Only add strict mode for OpenAI (not GLM/other compatible providers)
+            if not self._is_glm_provider():
+                parameters["strict"] = True
             tool_def = {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.input_schema,
+                "parameters": parameters,
             }
-            tool_def["parameters"]["strict"] = True
             openai_tools.append(
                 {
                     "type": "function",
@@ -922,14 +994,20 @@ class OpenAIDirectClient(BaseOpenAIClient):
         if len(openai_tools) == 0:
             tool_choice_param = None
 
+        # Determine max_tokens parameter name based on provider
+        if self._is_glm_provider():
+            max_tokens_param = {"max_tokens": max_tokens}
+        else:
+            max_tokens_param = {"max_completion_tokens": max_tokens}
+
         def _create_completion():
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=openai_messages,
                 tools=openai_tools if openai_tools else OpenAI_NOT_GIVEN,
                 tool_choice=tool_choice_param,
-                max_completion_tokens=max_tokens,
                 stop=stop_sequence,
+                **max_tokens_param,
             )
             assert response is not None, "OpenAI response is None"
             return response
@@ -1080,12 +1158,17 @@ class OpenAIDirectClient(BaseOpenAIClient):
 
         openai_tools = []
         for tool in tools:
+            # Copy schema to avoid mutating original tool.input_schema
+            # This prevents strict: true from leaking into GLM requests
+            parameters = tool.input_schema.copy()
+            # Only add strict mode for OpenAI (not GLM/other compatible providers)
+            if not self._is_glm_provider():
+                parameters["strict"] = True
             tool_def = {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.input_schema,
+                "parameters": parameters,
             }
-            tool_def["parameters"]["strict"] = True
             openai_tools.append(
                 {
                     "type": "function",
@@ -1093,14 +1176,20 @@ class OpenAIDirectClient(BaseOpenAIClient):
                 }
             )
 
+        # Determine max_tokens parameter name based on provider
+        if self._is_glm_provider():
+            max_tokens_param = {"max_tokens": max_tokens}
+        else:
+            max_tokens_param = {"max_completion_tokens": max_tokens}
+
         async def _create_completion() -> str:
             stream = await self.async_client.chat.completions.create(
                 model=self.model_name,
                 messages=openai_messages,
-                max_completion_tokens=max_tokens,
                 stop=stop_sequence,
                 presence_penalty=presence_penalty,
                 stream=True,
+                **max_tokens_param,
             )
             response = ""
             async for chunk in stream:

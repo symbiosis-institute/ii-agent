@@ -3,6 +3,7 @@
 This module tests the OpenAI provider functionality including:
 - Reasoning model detection
 - Parameter filtering for non-reasoning models
+- GLM/BigModel provider detection and compatibility
 
 Note: Tests use direct Pydantic model instantiation to avoid
 loading the full app config which requires environment variables.
@@ -11,6 +12,7 @@ loading the full app config which requires environment variables.
 import pytest
 from typing import ClassVar, Set, Dict, Any, Optional
 from pydantic import BaseModel
+from unittest.mock import Mock, MagicMock
 
 
 # Recreate the minimal OpenAIResponseParams for testing
