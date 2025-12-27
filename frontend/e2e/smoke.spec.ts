@@ -1,6 +1,48 @@
 import { test, expect } from '@playwright/test';
 
 /**
+ * Mock SSE stream response for chat API.
+ * Returns a deterministic response without requiring real LLM keys.
+ */
+function mockChatSSEStream() {
+  const sessionId = 'test-session-' + Math.random().toString(36).substr(2, 9);
+  return `
+event: session
+data: {"status":"created","session_id":"${sessionId}","name":"Test Chat","agent_type":"chat","model_id":"test"}
+
+event: content
+data: {"status":"start"}
+
+event: content
+data: {"status":"delta","delta":"Hello"}
+
+event: content
+data: {"status":"delta","delta":"!"}
+
+event: content
+data: {"status":"delta","delta":" This"}
+
+event: content
+data: {"status":"delta","delta":" is"}
+
+event: content
+data: {"status":"delta","delta":" a"}
+
+event: content
+data: {"status":"delta","delta":" mocked"}
+
+event: content
+data: {"status":"delta","delta":" response"}
+
+event: complete
+data: {"status":"done","message_id":"test-msg-1","finish_reason":"stop","elapsed_ms":100}
+
+event: complete
+data: [DONE]
+`;
+}
+
+/**
  * Smoke test that verifies the app loads without runtime errors.
  * This test MUST fail on any page error or console error.
  */
@@ -318,14 +360,13 @@ test('dev auto-login: user is automatically logged in without prompt', async ({ 
 
 /**
  * Test chat mode: send a message and receive an LLM response.
- * This is the critical test for verifying that Chat Mode actually returns an LLM response.
- * The test will fail if:
- * - The frontend sends but never receives a reply
- * - The backend errors silently
- * - Streaming/SSE/WebSocket wiring is broken
- * - Provider calls fail without user-visible errors
+ * Uses mocked SSE stream to be deterministic without real LLM keys.
+ * Verifies:
+ * - The frontend sends the request correctly
+ * - The SSE stream is properly parsed
+ * - The UI renders the assistant response
  */
-test('chat mode: send message and receive LLM response', async ({ page }) => {
+test('chat mode: send message and receive LLM response (mocked)', async ({ page }) => {
   const consoleErrors: string[] = [];
   const pageErrors: Error[] = [];
   const consoleMessages: string[] = [];
@@ -341,6 +382,20 @@ test('chat mode: send message and receive LLM response', async ({ page }) => {
     if (msg.type() === 'error') {
       consoleErrors.push(text);
     }
+  });
+
+  // Intercept the chat API call and return mocked SSE stream
+  await page.route('**/v1/chat/conversations', async (route) => {
+    const sseResponse = mockChatSSEStream();
+    await route.fulfill({
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      },
+      body: sseResponse,
+    });
   });
 
   // Navigate to homepage (dev auto-login should work)
@@ -402,30 +457,24 @@ test('chat mode: send message and receive LLM response', async ({ page }) => {
     await page.waitForTimeout(2000);
   }
 
-  // Wait for response - we should see either:
-  // 1. An assistant message with non-empty content
-  // 2. A visible UI error with meaningful message
-  // 3. Or timeout after 60 seconds (indicating no response)
-
+  // Wait for response - with mocked SSE, this should be fast
+  // We should see the assistant message from the mock
   let gotAssistantResponse = false;
   let gotVisibleError = false;
   let errorMessage = '';
 
-  const timeoutMs = 60000;
+  const timeoutMs = 10000; // Reduced timeout for mocked test
   const startTime = Date.now();
 
   while (Date.now() - startTime < timeoutMs) {
-    // Check for assistant message (look for common patterns)
-    const assistantMessage = page.locator('[data-testid="assistant-message"], .message.assistant, [role="assistant"]').first();
-    const isVisible = await assistantMessage.isVisible().catch(() => false);
+    // Check for assistant message - look for our mocked response text
+    // The UI renders messages in Response components with Streamdown
+    const hasMockedResponse = await page.getByText('Hello! This is a mocked response').isVisible().catch(() => false);
 
-    if (isVisible) {
-      const textContent = await assistantMessage.textContent();
-      if (textContent && textContent.trim().length > 0) {
-        gotAssistantResponse = true;
-        console.log(`✓ Assistant response received: "${textContent.trim().substring(0, 100)}..."`);
-        break;
-      }
+    if (hasMockedResponse) {
+      gotAssistantResponse = true;
+      console.log('✓ Assistant response received: "Hello! This is a mocked response"');
+      break;
     }
 
     // Check for visible error banners/toasts
@@ -481,7 +530,7 @@ test('chat mode: send message and receive LLM response', async ({ page }) => {
       throw new Error(`HTTP errors detected in console: ${httpErrors.join('; ')}`);
     }
 
-    throw new Error('No assistant response received after 60 seconds - chat may have failed silently');
+    throw new Error('No assistant response received after 10 seconds - mocked SSE may not be working correctly');
   }
 
   // Verify no page errors occurred during chat
